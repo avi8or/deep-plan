@@ -109,13 +109,13 @@ class TestConflictInfo:
         info = ConflictInfo(
             task_list_id="my-list",
             existing_task_count=15,
-            sample_subjects=["Task A", "Task B"],
+            sample_subjects=("Task A", "Task B"),
         )
         result = info.to_dict()
         assert result == {
             "task_list_id": "my-list",
             "existing_task_count": 15,
-            "sample_subjects": ["Task A", "Task B"],
+            "sample_subjects": ("Task A", "Task B"),
         }
 
 
@@ -187,7 +187,7 @@ class TestCheckForConflict:
         result = check_for_conflict("my-list", is_user_specified=True)
         assert result is not None
         assert result.existing_task_count == 2
-        assert result.sample_subjects == ["Valid Task"]
+        assert result.sample_subjects == ("Valid Task",)
 
     def test_nonexistent_directory_no_conflict(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Nonexistent task directory = no conflict."""

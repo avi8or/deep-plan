@@ -14,7 +14,7 @@ import pytest
 from scripts.lib.task_reconciliation import (
     TaskListContext,
     TaskListSource,
-    CurrentTask,
+    ReconciledTask,
     ConflictInfo,
     TaskOperation,
     ReconciliationResult,
@@ -256,7 +256,7 @@ class TestCheckForConflict:
     def test_session_based_with_tasks_no_conflict(self):
         """Session-based (is_user_specified=False) never conflicts."""
         ctx = TaskListContext(task_list_id="sess-123", source=TaskListSource.SESSION, is_user_specified=False)
-        current_tasks = {1: CurrentTask(id="1", subject="Task A", status="pending", description="", active_form="")}
+        current_tasks = {1: ReconciledTask(id="1", subject="Task A", status="pending", description="", active_form="")}
 
         result = check_for_conflict(ctx, current_tasks)
         assert result is None
@@ -272,10 +272,10 @@ class TestCheckForConflict:
         """User-specified + existing tasks -> conflict."""
         ctx = TaskListContext(task_list_id="my-proj", source=TaskListSource.USER_ENV, is_user_specified=True)
         current_tasks = {
-            1: CurrentTask(id="1", subject="Task A", status="pending", description="", active_form=""),
-            2: CurrentTask(id="2", subject="Task B", status="completed", description="", active_form=""),
-            3: CurrentTask(id="3", subject="Task C", status="in_progress", description="", active_form=""),
-            4: CurrentTask(id="4", subject="Task D", status="pending", description="", active_form=""),
+            1: ReconciledTask(id="1", subject="Task A", status="pending", description="", active_form=""),
+            2: ReconciledTask(id="2", subject="Task B", status="completed", description="", active_form=""),
+            3: ReconciledTask(id="3", subject="Task C", status="in_progress", description="", active_form=""),
+            4: ReconciledTask(id="4", subject="Task D", status="pending", description="", active_form=""),
         }
 
         result = check_for_conflict(ctx, current_tasks)
@@ -288,7 +288,7 @@ class TestCheckForConflict:
     def test_no_task_list_id_no_conflict(self):
         """No task_list_id -> no conflict check possible (is_user_specified is False)."""
         ctx = TaskListContext(task_list_id=None, source=TaskListSource.NONE, is_user_specified=False)
-        current_tasks = {1: CurrentTask(id="1", subject="Task", status="pending", description="", active_form="")}
+        current_tasks = {1: ReconciledTask(id="1", subject="Task", status="pending", description="", active_form="")}
 
         result = check_for_conflict(ctx, current_tasks)
         assert result is None
@@ -312,8 +312,8 @@ class TestComputeOperationsEmpty:
         # If expected is empty, all existing tasks are beyond expected count (0)
         # and should be marked obsolete
         current = {
-            1: CurrentTask(id="1", subject="Existing A", status="pending", description="", active_form=""),
-            2: CurrentTask(id="2", subject="Existing B", status="in_progress", description="", active_form=""),
+            1: ReconciledTask(id="1", subject="Existing A", status="pending", description="", active_form=""),
+            2: ReconciledTask(id="2", subject="Existing B", status="in_progress", description="", active_form=""),
         }
         ops = compute_operations([], current)
 
@@ -383,7 +383,7 @@ class TestComputeOperationsTransform:
         """Position 1 exists with different subject -> TaskUpdate to transform."""
         expected = [{"subject": "plugin_root=/path", "status": "completed", "description": "Context", "activeForm": ""}]
         current = {
-            1: CurrentTask(id="1", subject="Old Subject", status="pending", description="Old desc", active_form="Old form"),
+            1: ReconciledTask(id="1", subject="Old Subject", status="pending", description="Old desc", active_form="Old form"),
         }
 
         ops = compute_operations(expected, current)
@@ -399,7 +399,7 @@ class TestComputeOperationsTransform:
         """Only update fields that differ."""
         expected = [{"subject": "Same Subject", "status": "completed", "description": "Same desc", "activeForm": ""}]
         current = {
-            1: CurrentTask(id="1", subject="Same Subject", status="pending", description="Same desc", active_form=""),
+            1: ReconciledTask(id="1", subject="Same Subject", status="pending", description="Same desc", active_form=""),
         }
 
         ops = compute_operations(expected, current)
@@ -415,7 +415,7 @@ class TestComputeOperationsTransform:
         """Position exists with all matching fields -> no operation."""
         expected = [{"subject": "Task A", "status": "completed", "description": "Desc", "activeForm": "Form"}]
         current = {
-            1: CurrentTask(id="1", subject="Task A", status="completed", description="Desc", active_form="Form"),
+            1: ReconciledTask(id="1", subject="Task A", status="completed", description="Desc", active_form="Form"),
         }
 
         ops = compute_operations(expected, current)
@@ -434,7 +434,7 @@ class TestComputeOperationsTransform:
         for current_status, expected_status in transitions:
             expected = [{"subject": "Task", "status": expected_status, "description": "", "activeForm": ""}]
             current = {
-                1: CurrentTask(id="1", subject="Task", status=current_status, description="", active_form=""),
+                1: ReconciledTask(id="1", subject="Task", status=current_status, description="", active_form=""),
             }
 
             ops = compute_operations(expected, current)
@@ -460,8 +460,8 @@ class TestComputeOperationsMixed:
             {"subject": "Step 4", "status": "pending", "description": "", "activeForm": ""},
         ]
         current = {
-            1: CurrentTask(id="1", subject="Old Task 1", status="pending", description="", active_form=""),
-            2: CurrentTask(id="2", subject="Old Task 2", status="pending", description="", active_form=""),
+            1: ReconciledTask(id="1", subject="Old Task 1", status="pending", description="", active_form=""),
+            2: ReconciledTask(id="2", subject="Old Task 2", status="pending", description="", active_form=""),
         }
 
         ops = compute_operations(expected, current)
@@ -484,7 +484,7 @@ class TestComputeOperationsMixed:
         """Simulate actual deep-plan: 11 existing tasks -> 21 expected tasks."""
         # Existing: 11 tasks with various subjects from previous workflow
         current = {
-            i: CurrentTask(id=str(i), subject=f"Old Task {i}", status="pending", description="", active_form="")
+            i: ReconciledTask(id=str(i), subject=f"Old Task {i}", status="pending", description="", active_form="")
             for i in range(1, 12)  # 1-11
         }
 
@@ -534,9 +534,9 @@ class TestComputeOperationsMixed:
             {"subject": "Step 3", "status": "pending", "description": "", "activeForm": ""},
         ]
         current = {
-            1: CurrentTask(id="1", subject="Step 1", status="completed", description="", active_form=""),
-            2: CurrentTask(id="2", subject="Step 2", status="in_progress", description="", active_form=""),
-            3: CurrentTask(id="3", subject="Step 3", status="pending", description="", active_form=""),
+            1: ReconciledTask(id="1", subject="Step 1", status="completed", description="", active_form=""),
+            2: ReconciledTask(id="2", subject="Step 2", status="in_progress", description="", active_form=""),
+            3: ReconciledTask(id="3", subject="Step 3", status="pending", description="", active_form=""),
         }
 
         ops = compute_operations(expected, current)
@@ -559,8 +559,8 @@ class TestComputeOperationsEdgeCases:
             {"subject": "Task 3", "status": "pending", "description": "", "activeForm": ""},
         ]
         current = {
-            1: CurrentTask(id="1", subject="Old 1", status="pending", description="", active_form=""),
-            3: CurrentTask(id="3", subject="Old 3", status="pending", description="", active_form=""),
+            1: ReconciledTask(id="1", subject="Old 1", status="pending", description="", active_form=""),
+            3: ReconciledTask(id="3", subject="Old 3", status="pending", description="", active_form=""),
             # Position 2 doesn't exist
         }
 
@@ -582,9 +582,9 @@ class TestComputeOperationsEdgeCases:
             {"subject": "Task 1", "status": "completed", "description": "", "activeForm": ""},
         ]
         current = {
-            1: CurrentTask(id="1", subject="Old 1", status="pending", description="", active_form=""),
-            2: CurrentTask(id="2", subject="Old 2", status="pending", description="", active_form=""),
-            3: CurrentTask(id="3", subject="Old 3", status="pending", description="", active_form=""),
+            1: ReconciledTask(id="1", subject="Old 1", status="pending", description="", active_form=""),
+            2: ReconciledTask(id="2", subject="Old 2", status="pending", description="", active_form=""),
+            3: ReconciledTask(id="3", subject="Old 3", status="pending", description="", active_form=""),
         }
 
         ops = compute_operations(expected, current)
@@ -607,7 +607,7 @@ class TestComputeOperationsEdgeCases:
         """Subjects with special chars work correctly."""
         expected = [{"subject": "plugin_root=/path/to/plugin", "status": "completed", "description": "", "activeForm": ""}]
         current = {
-            1: CurrentTask(id="1", subject="Old: (something) [different]", status="pending", description="", active_form=""),
+            1: ReconciledTask(id="1", subject="Old: (something) [different]", status="pending", description="", active_form=""),
         }
 
         ops = compute_operations(expected, current)
@@ -630,9 +630,9 @@ class TestComputeOperationsEdgeCases:
             {"subject": "Task 1", "status": "completed", "description": "", "activeForm": ""},
         ]
         current = {
-            1: CurrentTask(id="1", subject="Old 1", status="pending", description="", active_form=""),
-            2: CurrentTask(id="2", subject="[obsolete]", status="completed", description="", active_form=""),
-            3: CurrentTask(id="3", subject="Old 3", status="pending", description="", active_form=""),
+            1: ReconciledTask(id="1", subject="Old 1", status="pending", description="", active_form=""),
+            2: ReconciledTask(id="2", subject="[obsolete]", status="completed", description="", active_form=""),
+            3: ReconciledTask(id="3", subject="Old 3", status="pending", description="", active_form=""),
         }
 
         ops = compute_operations(expected, current)
@@ -650,9 +650,9 @@ class TestComputeOperationsEdgeCases:
             {"subject": "Task 1", "status": "completed", "description": "", "activeForm": ""},
         ]
         current = {
-            1: CurrentTask(id="1", subject="Old 1", status="pending", description="", active_form=""),
-            3: CurrentTask(id="3", subject="Old 3", status="pending", description="", active_form=""),
-            5: CurrentTask(id="5", subject="Old 5", status="pending", description="", active_form=""),
+            1: ReconciledTask(id="1", subject="Old 1", status="pending", description="", active_form=""),
+            3: ReconciledTask(id="3", subject="Old 3", status="pending", description="", active_form=""),
+            5: ReconciledTask(id="5", subject="Old 5", status="pending", description="", active_form=""),
         }
 
         ops = compute_operations(expected, current)
@@ -815,14 +815,14 @@ class TestDataclassSerialization:
         info = ConflictInfo(
             task_list_id="my-project",
             existing_task_count=5,
-            sample_subjects=["Task A", "Task B"],
+            sample_subjects=("Task A", "Task B"),
         )
         result = info.to_dict()
 
         assert result == {
             "task_list_id": "my-project",
             "existing_task_count": 5,
-            "sample_subjects": ["Task A", "Task B"],
+            "sample_subjects": ("Task A", "Task B"),
         }
 
     def test_task_operation_to_dict_without_then(self):

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Self
 
 from lib.tasks import TASK_IDS, TaskStatus
+from lib.types import ConflictInfo, StoredTask  # noqa: F401 — re-exported
 
 # Position constants
 CONTEXT_TASK_COUNT = 4  # Positions 1-4
@@ -33,32 +34,20 @@ def get_tasks_dir(task_list_id: str) -> Path:
     return Path.home() / ".claude" / "tasks" / task_list_id
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class CurrentTask:
-    """A task read from disk."""
-
-    position: int
-    subject: str
-    status: str
-    description: str = ""
-    blocks: tuple[str, ...] = ()
-    blocked_by: tuple[str, ...] = ()
-
-
-def read_current_tasks(task_list_id: str) -> dict[int, CurrentTask]:
+def read_current_tasks(task_list_id: str) -> dict[int, StoredTask]:
     """Read current tasks from disk.
 
     Args:
         task_list_id: The task list ID
 
     Returns:
-        Dict mapping position -> CurrentTask
+        Dict mapping position -> StoredTask
     """
     tasks_dir = get_tasks_dir(task_list_id)
     if not tasks_dir.exists():
         return {}
 
-    result: dict[int, CurrentTask] = {}
+    result: dict[int, StoredTask] = {}
     for task_file in tasks_dir.glob("*.json"):
         try:
             position = int(task_file.stem)
@@ -68,7 +57,7 @@ def read_current_tasks(task_list_id: str) -> dict[int, CurrentTask]:
             if data.get("subject") == "[obsolete]":
                 continue
 
-            result[position] = CurrentTask(
+            result[position] = StoredTask(
                 position=position,
                 subject=data.get("subject", ""),
                 status=data.get("status", "pending"),
@@ -170,22 +159,6 @@ class TaskWriteResult:
         )
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ConflictInfo:
-    """Information about existing tasks in a user-specified task list."""
-
-    task_list_id: str
-    existing_task_count: int
-    sample_subjects: list[str]
-
-    def to_dict(self) -> dict:
-        return {
-            "task_list_id": self.task_list_id,
-            "existing_task_count": self.existing_task_count,
-            "sample_subjects": self.sample_subjects,
-        }
-
-
 def check_for_conflict(
     task_list_id: str,
     is_user_specified: bool,
@@ -229,7 +202,7 @@ def check_for_conflict(
     return ConflictInfo(
         task_list_id=task_list_id,
         existing_task_count=len(task_files),
-        sample_subjects=sample_subjects,
+        sample_subjects=tuple(sample_subjects),
     )
 
 

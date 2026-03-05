@@ -29,6 +29,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Self
 
+from lib.types import ConflictInfo, ReconciledTask  # noqa: F401 — re-exported
+
 
 class TaskListSource(StrEnum):
     """Source of the task list ID."""
@@ -120,18 +122,7 @@ class TaskListContext:
         )
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class CurrentTask:
-    """A task read from the task list directory."""
-
-    id: str
-    subject: str
-    status: str
-    description: str
-    active_form: str
-
-
-def read_current_tasks(task_list_id: str | None) -> dict[int, CurrentTask]:
+def read_current_tasks(task_list_id: str | None) -> dict[int, ReconciledTask]:
     """Read current tasks from ~/.claude/tasks/<task_list_id>/
 
     IMPORTANT: Tasks are keyed by their numeric ID (position), NOT by subject.
@@ -142,7 +133,7 @@ def read_current_tasks(task_list_id: str | None) -> dict[int, CurrentTask]:
         task_list_id: The task list ID (session ID or user-specified)
 
     Returns:
-        Dict of {id (int): CurrentTask}
+        Dict of {id (int): ReconciledTask}
     """
     if not task_list_id:
         return {}
@@ -151,13 +142,13 @@ def read_current_tasks(task_list_id: str | None) -> dict[int, CurrentTask]:
     if not tasks_dir.exists():
         return {}
 
-    tasks: dict[int, CurrentTask] = {}
+    tasks: dict[int, ReconciledTask] = {}
     for task_file in sorted(tasks_dir.glob("*.json")):
         try:
             with open(task_file) as f:
                 task_data = json.load(f)
                 task_id = int(task_data["id"])  # Numeric ID for position-based matching
-                task = CurrentTask(
+                task = ReconciledTask(
                     id=task_data["id"],  # Keep string version for TaskUpdate
                     subject=task_data["subject"],
                     status=task_data["status"],
@@ -172,26 +163,9 @@ def read_current_tasks(task_list_id: str | None) -> dict[int, CurrentTask]:
     return tasks
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ConflictInfo:
-    """Information about a task list conflict."""
-
-    task_list_id: str
-    existing_task_count: int
-    sample_subjects: list[str]
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for JSON output."""
-        return {
-            "task_list_id": self.task_list_id,
-            "existing_task_count": self.existing_task_count,
-            "sample_subjects": self.sample_subjects,
-        }
-
-
 def check_for_conflict(
     context: TaskListContext,
-    current_tasks: dict[int, CurrentTask],
+    current_tasks: dict[int, ReconciledTask],
 ) -> ConflictInfo | None:
     """Check if user-specified task list has existing tasks.
 
@@ -223,7 +197,7 @@ def check_for_conflict(
     return ConflictInfo(
         task_list_id=context.task_list_id or "",
         existing_task_count=len(current_tasks),
-        sample_subjects=sample_subjects,
+        sample_subjects=tuple(sample_subjects),
     )
 
 
@@ -250,7 +224,7 @@ class TaskOperation:
 
 def compute_operations(
     expected_tasks: list[dict],
-    current_tasks: dict[int, CurrentTask],
+    current_tasks: dict[int, ReconciledTask],
 ) -> list[TaskOperation]:
     """Compute exact TaskCreate/TaskUpdate operations using POSITION-BASED matching.
 
@@ -262,7 +236,7 @@ def compute_operations(
 
     Args:
         expected_tasks: List of {subject, status, description, activeForm} in order
-        current_tasks: Dict of {id (int): CurrentTask} keyed by numeric ID
+        current_tasks: Dict of {id (int): ReconciledTask} keyed by numeric ID
 
     Returns:
         List of TaskOperation ready for Claude to execute (empty if all match)
