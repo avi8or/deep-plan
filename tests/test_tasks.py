@@ -319,3 +319,20 @@ class TestConstants:
         # Workflow steps
         for step in TASK_IDS:
             assert step in STEP_NAMES, f"Step {step} missing from STEP_NAMES"
+
+
+def test_task_status_values_match_cross_repo_canonical():
+    """Verify TaskStatus values haven't drifted from the cross-repo canonical set.
+
+    TaskStatus is defined independently in deep-plan and deep-implement.
+    This test ensures the values stay in sync by checking against a
+    hardcoded canonical set. If this test fails, update the sibling repo
+    to match.
+    """
+    expected = {"pending", "in_progress", "completed"}
+    actual = {status.value for status in TaskStatus}
+    assert actual == expected, (
+        f"Cross-repo sync check failed: TaskStatus values drifted. "
+        f"Expected {expected}, got {actual}. "
+        f"Update deep-implement's TaskStatus to match, or vice versa."
+    )
