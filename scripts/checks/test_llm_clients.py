@@ -11,6 +11,7 @@ Usage:
   uv run test_llm_clients.py --gemini-api-key MODEL      # Test Gemini API key + model
   uv run test_llm_clients.py --vertex-ai PROJECT LOC MODEL  # Test Vertex AI + model
   uv run test_llm_clients.py --openai MODEL              # Test OpenAI + model
+  uv run test_llm_clients.py --openrouter MODEL          # Test OpenRouter + model
 
 Returns JSON with test results. Exit 0 if tested clients work, 1 if any fail.
 """
@@ -147,12 +148,47 @@ def test_openai(model: str) -> dict:
         return {"success": False, "model": model, "error": str(e)}
 
 
+def test_openrouter(model: str) -> dict:
+    """Test OpenRouter client via OpenAI-compatible API and verify model can generate.
+
+    Args:
+        model: Model name from config (e.g., 'anthropic/claude-sonnet-4')
+    """
+    try:
+        from openai import OpenAI, NotFoundError
+
+        client = OpenAI(
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            base_url="https://openrouter.ai/api/v1",
+        )
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_completion_tokens=5
+        )
+        return {
+            "success": True,
+            "model": model,
+            "test": "generation"
+        }
+    except NotFoundError as e:
+        return {
+            "success": False,
+            "model": model,
+            "error": f"Model '{model}' not found or not accessible on OpenRouter",
+            "details": str(e)
+        }
+    except Exception as e:
+        return {"success": False, "model": model, "error": str(e)}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test LLM client construction and model access")
     parser.add_argument("--gemini-api-key", metavar="MODEL", help="Test Gemini with API key")
     parser.add_argument("--vertex-ai", nargs=3, metavar=("PROJECT", "LOCATION", "MODEL"),
                         help="Test Gemini with Vertex AI")
     parser.add_argument("--openai", metavar="MODEL", help="Test OpenAI with specific model")
+    parser.add_argument("--openrouter", metavar="MODEL", help="Test OpenRouter with specific model")
     args = parser.parse_args()
 
     results = {}
@@ -172,6 +208,11 @@ def main():
     if args.openai:
         results["openai"] = test_openai(args.openai)
         if not results["openai"]["success"]:
+            any_failure = True
+
+    if args.openrouter:
+        results["openrouter"] = test_openrouter(args.openrouter)
+        if not results["openrouter"]["success"]:
             any_failure = True
 
     print(json.dumps(results))

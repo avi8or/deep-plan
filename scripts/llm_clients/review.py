@@ -5,7 +5,7 @@ Unified plan review orchestrator.
 Usage:
   uv run review.py --planning-dir /path/to/planning
 
-Checks which LLMs are available (Gemini, OpenAI) and runs reviews in parallel.
+Checks which LLMs are available (Gemini, OpenAI, OpenRouter) and runs reviews in parallel.
 Writes results to <planning_dir>/reviews/ directory.
 
 Returns JSON with combined results from all available reviewers.
@@ -116,6 +116,11 @@ def check_openai_available() -> bool:
     return bool(os.environ.get("OPENAI_API_KEY"))
 
 
+def check_openrouter_available() -> bool:
+    """Check if OpenRouter API key is available."""
+    return bool(os.environ.get("OPENROUTER_API_KEY"))
+
+
 def review_with_gemini(plan_content: str, system_prompt: str, user_prompt: str, config: dict) -> dict:
     """Run Gemini review."""
     client, auth_method = get_gemini_client(config)
@@ -191,6 +196,51 @@ def review_with_openai(plan_content: str, system_prompt: str, user_prompt: str, 
         }
 
 
+def review_with_openrouter(plan_content: str, system_prompt: str, user_prompt: str, config: dict) -> dict:
+    """Run OpenRouter review. Uses OpenAI-compatible API with different base_url."""
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return {"success": False, "provider": "openrouter", "error": "OPENROUTER_API_KEY not set"}
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return {"success": False, "provider": "openrouter", "error": "openai package not installed"}
+
+    model_name = os.environ.get("OPENROUTER_MODEL", config["models"]["openrouter"])
+    timeout = config["llm_client"]["timeout_seconds"]
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            timeout=timeout,
+        )
+        response = call_with_retry(
+            lambda: client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            ),
+            config
+        )
+        return {
+            "success": True,
+            "provider": "openrouter",
+            "model": model_name,
+            "analysis": response.choices[0].message.content
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "provider": "openrouter",
+            "model": model_name,
+            "error": str(e)
+        }
+
+
 def write_review_file(reviews_dir: Path, provider: str, iteration: int, result: dict) -> Path:
     """Write review result to file."""
     reviews_dir.mkdir(parents=True, exist_ok=True)
@@ -243,25 +293,34 @@ def main():
     gemini_client, gemini_auth = get_gemini_client(config)
     gemini_available = gemini_client is not None
     openai_available = check_openai_available()
+    openrouter_available = check_openrouter_available()
 
-    if not gemini_available and not openai_available:
+    if not gemini_available and not openai_available and not openrouter_available:
         print(json.dumps({
             "error": "No LLM providers available",
             "gemini_status": gemini_auth or "no_auth",
-            "openai_status": "no_api_key"
+            "openai_status": "no_api_key",
+            "openrouter_status": "no_api_key"
         }))
         sys.exit(1)
 
-    # Prepare review tasks
+    # Prepare review tasks — run all available providers in parallel
     results = {}
     reviews_dir = args.planning_dir / "reviews"
 
-    if gemini_available and openai_available:
-        # Run both in parallel
-        with ThreadPoolExecutor(max_workers=2) as executor:
+    review_funcs = {}
+    if gemini_available:
+        review_funcs["gemini"] = review_with_gemini
+    if openai_available:
+        review_funcs["openai"] = review_with_openai
+    if openrouter_available:
+        review_funcs["openrouter"] = review_with_openrouter
+
+    if len(review_funcs) > 1:
+        with ThreadPoolExecutor(max_workers=len(review_funcs)) as executor:
             futures = {
-                executor.submit(review_with_gemini, plan_content, system_prompt, user_prompt, config): "gemini",
-                executor.submit(review_with_openai, plan_content, system_prompt, user_prompt, config): "openai"
+                executor.submit(func, plan_content, system_prompt, user_prompt, config): provider
+                for provider, func in review_funcs.items()
             }
             for future in as_completed(futures):
                 provider = futures[future]
@@ -269,10 +328,9 @@ def main():
                     results[provider] = future.result()
                 except Exception as e:
                     results[provider] = {"success": False, "provider": provider, "error": str(e)}
-    elif gemini_available:
-        results["gemini"] = review_with_gemini(plan_content, system_prompt, user_prompt, config)
     else:
-        results["openai"] = review_with_openai(plan_content, system_prompt, user_prompt, config)
+        provider, func = next(iter(review_funcs.items()))
+        results[provider] = func(plan_content, system_prompt, user_prompt, config)
 
     # Write review files
     files_written = []
@@ -285,7 +343,8 @@ def main():
         "reviews": results,
         "files_written": files_written,
         "gemini_available": gemini_available,
-        "openai_available": openai_available
+        "openai_available": openai_available,
+        "openrouter_available": openrouter_available
     }
 
     print(json.dumps(output, indent=2))

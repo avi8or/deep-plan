@@ -40,6 +40,7 @@ errors=()
 warnings=()
 gemini_auth="null"
 openai_auth="false"
+openrouter_auth="false"
 
 # Check 1: uv must be installed
 if ! command -v uv &> /dev/null; then
@@ -54,6 +55,7 @@ config_gcp_project=""
 config_gcp_location=""
 gemini_model=""
 openai_model=""
+openrouter_model=""
 
 if [ -f "$config_file" ]; then
     # Parse values from config using jq
@@ -68,6 +70,7 @@ if [ -f "$config_file" ]; then
     # Get model names from config
     gemini_model=$(jq -r '.models.gemini // empty' "$config_file" 2>/dev/null || echo "")
     openai_model=$(jq -r '.models.chatgpt // empty' "$config_file" 2>/dev/null || echo "")
+    openrouter_model=$(jq -r '.models.openrouter // empty' "$config_file" 2>/dev/null || echo "")
 fi
 
 # Get GCP project from gcloud config (if gcloud is available)
@@ -138,6 +141,15 @@ else
     fi
 fi
 
+# Check 3b: OpenRouter API key
+if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+    openrouter_auth="true"
+else
+    if [ "$alert_if_missing" = "true" ]; then
+        warnings+=("OPENROUTER_API_KEY not set (optional)")
+    fi
+fi
+
 # Check 4: Test actual client construction AND model access
 # Only run if we have potential auth methods to test AND models configured
 test_script="${SCRIPT_DIR}/test_llm_clients.py"
@@ -156,6 +168,10 @@ if [ -f "$test_script" ]; then
 
     if [ -n "${OPENAI_API_KEY:-}" ] && [ -n "$openai_model" ]; then
         test_args="$test_args --openai $openai_model"
+    fi
+
+    if [ -n "${OPENROUTER_API_KEY:-}" ] && [ -n "$openrouter_model" ]; then
+        test_args="$test_args --openrouter $openrouter_model"
     fi
 
     # Run the test if we have any auth to test
@@ -191,6 +207,16 @@ if [ -f "$test_script" ]; then
                     openai_auth="false"
                 fi
             fi
+
+            # Check for OpenRouter failures
+            if echo "$client_test_results" | jq -e '.openrouter' > /dev/null 2>&1; then
+                openrouter_success=$(echo "$client_test_results" | jq -r '.openrouter.success' 2>/dev/null)
+                if [ "$openrouter_success" = "false" ]; then
+                    openrouter_error=$(echo "$client_test_results" | jq -r '.openrouter.error' 2>/dev/null)
+                    warnings+=("OpenRouter model test failed: $openrouter_error")
+                    openrouter_auth="false"
+                fi
+            fi
         fi
     fi
 fi
@@ -219,5 +245,5 @@ if [ ${#errors[@]} -gt 0 ]; then
     fi
 fi
 
-echo "{\"valid\": $valid, \"errors\": $errors_json, \"warnings\": $warnings_json, \"gemini_auth\": $gemini_auth, \"openai_auth\": $openai_auth, \"plugin_root\": \"$PLUGIN_ROOT\"}"
+echo "{\"valid\": $valid, \"errors\": $errors_json, \"warnings\": $warnings_json, \"gemini_auth\": $gemini_auth, \"openai_auth\": $openai_auth, \"openrouter_auth\": $openrouter_auth, \"plugin_root\": \"$PLUGIN_ROOT\"}"
 exit $exit_code

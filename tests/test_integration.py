@@ -60,6 +60,7 @@ class TestFullWorkflow:
         # Clear all LLM auth
         env.pop("GEMINI_API_KEY", None)
         env.pop("OPENAI_API_KEY", None)
+        env.pop("OPENROUTER_API_KEY", None)
         env.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
         env["HOME"] = str(tmp_path)  # No ADC here
 

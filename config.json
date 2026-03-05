@@ -17,7 +17,8 @@
   "models": {
     "gemini": "gemini-3-pro-preview",
     "chatgpt": "gpt-5.2",
-    "_comment": "Models used for external plan review"
+    "openrouter": "anthropic/claude-sonnet-4",
+    "_comment": "Models used for external plan review. openrouter accepts any model from https://openrouter.ai/models"
   },
   "llm_client": {
     "timeout_seconds": 120,
