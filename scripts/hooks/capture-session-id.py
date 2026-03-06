@@ -5,6 +5,7 @@ This hook reads session_id from the JSON payload on stdin and:
 1. Outputs it to stdout as additionalContext (Claude sees this directly)
 2. Also captures CLAUDE_PLUGIN_ROOT as DEEP_PLUGIN_ROOT (for SKILL.md path resolution)
 3. Optionally writes to CLAUDE_ENV_FILE if available (fallback for bash)
+4. Discovers and surfaces snapshot.json resume state if available
 
 The additionalContext approach is primary because:
 - CLAUDE_ENV_FILE is unreliable (empty string bug, not sourced on resume)
@@ -35,6 +36,59 @@ Usage:
 import json
 import os
 import sys
+from pathlib import Path
+
+# Set up imports for snapshot module
+_scripts_dir = str(Path(__file__).resolve().parent.parent)
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+
+try:
+    from lib.snapshot import read_snapshot, validate_snapshot, format_resume_context, clear_hook_errors
+    _snapshot_available = True
+except ImportError:
+    _snapshot_available = False
+
+
+def discover_snapshot_path() -> str | None:
+    """Find snapshot.json by checking CWD and walking up to 3 parent levels."""
+    cwd = Path(os.getcwd())
+
+    # Direct check
+    direct = cwd / "snapshot.json"
+    if direct.is_file():
+        return str(direct)
+
+    # Check for config files in CWD and parent dirs
+    config_names = {
+        "deep_plan_config.json": "planning_dir",
+        "deep_implement_config.json": "state_dir",
+    }
+
+    search_dir = cwd
+    for _ in range(4):  # CWD + 3 parent levels
+        for config_name, dir_key in config_names.items():
+            config_path = search_dir / config_name
+            if config_path.is_file():
+                try:
+                    with open(config_path) as f:
+                        config = json.load(f)
+                    target_dir = config.get(dir_key)
+                    if target_dir:
+                        target_path = Path(target_dir)
+                        if not target_path.is_absolute():
+                            target_path = config_path.parent / target_path
+                        snapshot = target_path / "snapshot.json"
+                        if snapshot.is_file():
+                            return str(snapshot)
+                except (json.JSONDecodeError, OSError, KeyError):
+                    continue
+        parent = search_dir.parent
+        if parent == search_dir:
+            break  # Reached filesystem root
+        search_dir = parent
+
+    return None
 
 
 def main() -> int:
@@ -71,6 +125,29 @@ def main() -> int:
 
     if plugin_root:
         context_parts.append(f"DEEP_PLUGIN_ROOT={plugin_root}")
+
+    # Snapshot discovery and resume context
+    if _snapshot_available:
+        try:
+            snapshot_path = discover_snapshot_path()
+            if snapshot_path:
+                snapshot = read_snapshot(snapshot_path)
+                if snapshot is not None:
+                    planning_dir = str(Path(snapshot_path).parent)
+                    if validate_snapshot(snapshot, planning_dir):
+                        resume_ctx = format_resume_context(snapshot, snapshot_path=snapshot_path)
+                        for key, value in resume_ctx.items():
+                            # Skip DEEP_SESSION_ID — already handled above
+                            if key == "DEEP_SESSION_ID":
+                                continue
+                            context_parts.append(f"{key}={value}")
+
+                        # Clear hook errors after surfacing
+                        if snapshot.get("hook_errors"):
+                            clear_hook_errors(snapshot_path)
+        except Exception:
+            # Snapshot operations must never crash the hook
+            pass
 
     if context_parts:
         output = {

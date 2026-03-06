@@ -7,12 +7,19 @@ to CLAUDE_ENV_FILE (secondary fallback for bash commands).
 """
 
 import json
+import os
 import sys
+import time
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+# Add scripts to path for snapshot module
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from lib.snapshot import write_snapshot
 
 # Add scripts to path for importing the hook
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts" / "hooks"))
@@ -316,3 +323,220 @@ class TestCaptureSessionIdHook:
         # Session ID matches so it's not in context, but plugin_root is
         assert "DEEP_SESSION_ID" not in context
         assert "DEEP_PLUGIN_ROOT=/path/to/plugin" in context
+
+
+def _make_valid_snapshot(tmp_path, **overrides):
+    """Create a valid snapshot.json in tmp_path and return the path."""
+    snap_path = str(tmp_path / "snapshot.json")
+    data = {
+        "version": 1,
+        "plugin": "deep-plan",
+        "session_id": "test-sess",
+        "updated_at": datetime(2099, 1, 1, tzinfo=timezone.utc).isoformat(),
+        "resume_step": 5,
+        "resume_step_name": "research-complete",
+        "completed_artifacts": [],
+        "section_progress": {"total": 6, "completed": 2, "current": "section-03"},
+        "task_summary": {"total": 22, "completed": 14, "current_task_id": "15"},
+        "git_branch": "feature/test",
+        "key_decisions": ["use dataclasses"],
+        "env_validation": None,
+        "hook_errors": [],
+    }
+    data.update(overrides)
+    write_snapshot(snap_path, data)
+    return snap_path
+
+
+def _run_hook(hook_module, session_id="test-123", env=None, cwd=None):
+    """Helper to run the hook with optional CWD and env patches."""
+    payload = {"session_id": session_id}
+    env = env or {}
+    patches = [
+        patch.dict("os.environ", env, clear=True),
+        patch("sys.stdin", StringIO(json.dumps(payload))),
+    ]
+    if cwd:
+        patches.append(patch("os.getcwd", return_value=str(cwd)))
+    with patches[0], patches[1]:
+        if len(patches) > 2:
+            with patches[2]:
+                return hook_module.main()
+        return hook_module.main()
+
+
+class TestSnapshotDiscovery:
+    """Tests for snapshot.json discovery logic in the SessionStart hook."""
+
+    def test_finds_snapshot_in_cwd(self, hook_module, tmp_path, capsys):
+        """Hook finds snapshot.json when it exists directly in CWD."""
+        _make_valid_snapshot(tmp_path)
+
+        _run_hook(hook_module, cwd=tmp_path)
+
+        captured = capsys.readouterr()
+        assert "DEEP_SNAPSHOT" in captured.out
+
+    def test_finds_snapshot_via_deep_plan_config_in_cwd(self, hook_module, tmp_path, capsys):
+        """Hook reads deep_plan_config.json in CWD, extracts planning_dir, finds snapshot there."""
+        planning_dir = tmp_path / "planning"
+        planning_dir.mkdir()
+        _make_valid_snapshot(planning_dir)
+
+        config = {"planning_dir": str(planning_dir), "plugin_root": "/tmp", "initial_file": "spec.md"}
+        (tmp_path / "deep_plan_config.json").write_text(json.dumps(config))
+
+        _run_hook(hook_module, cwd=tmp_path)
+
+        captured = capsys.readouterr()
+        assert "DEEP_SNAPSHOT" in captured.out
+        assert str(planning_dir) in captured.out
+
+    def test_finds_snapshot_via_deep_implement_config_in_cwd(self, hook_module, tmp_path, capsys):
+        """Hook reads deep_implement_config.json in CWD, extracts state_dir, finds snapshot there."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        _make_valid_snapshot(state_dir)
+
+        config = {"state_dir": str(state_dir)}
+        (tmp_path / "deep_implement_config.json").write_text(json.dumps(config))
+
+        _run_hook(hook_module, cwd=tmp_path)
+
+        captured = capsys.readouterr()
+        assert "DEEP_SNAPSHOT" in captured.out
+
+    def test_walks_up_max_3_levels_to_find_config(self, hook_module, tmp_path, capsys):
+        """Hook walks up parent directories (max 3 levels) to find config file."""
+        # Config is 2 levels above CWD
+        planning_dir = tmp_path / "planning"
+        planning_dir.mkdir()
+        _make_valid_snapshot(planning_dir)
+
+        config = {"planning_dir": str(planning_dir), "plugin_root": "/tmp", "initial_file": "spec.md"}
+        (tmp_path / "deep_plan_config.json").write_text(json.dumps(config))
+
+        deep_cwd = tmp_path / "level1" / "level2"
+        deep_cwd.mkdir(parents=True)
+
+        _run_hook(hook_module, cwd=deep_cwd)
+
+        captured = capsys.readouterr()
+        assert "DEEP_SNAPSHOT" in captured.out
+
+    def test_returns_no_snapshot_beyond_3_levels(self, hook_module, tmp_path, capsys):
+        """Hook stops walking after 3 levels; snapshot 4+ levels up is not found."""
+        planning_dir = tmp_path / "planning"
+        planning_dir.mkdir()
+        _make_valid_snapshot(planning_dir)
+
+        config = {"planning_dir": str(planning_dir), "plugin_root": "/tmp", "initial_file": "spec.md"}
+        (tmp_path / "deep_plan_config.json").write_text(json.dumps(config))
+
+        deep_cwd = tmp_path / "l1" / "l2" / "l3" / "l4"
+        deep_cwd.mkdir(parents=True)
+
+        _run_hook(hook_module, cwd=deep_cwd)
+
+        captured = capsys.readouterr()
+        assert "DEEP_SNAPSHOT" not in captured.out
+
+    def test_discovery_completes_quickly(self, hook_module, tmp_path):
+        """Snapshot discovery completes in under 100ms even with no snapshot found."""
+        start = time.monotonic()
+        _run_hook(hook_module, cwd=tmp_path)
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.1
+
+
+class TestSnapshotIntegrationInHook:
+    """Tests for snapshot data appearing in additionalContext output."""
+
+    def test_outputs_extended_context_with_valid_snapshot(self, hook_module, tmp_path, capsys):
+        """Valid snapshot produces DEEP_SNAPSHOT, DEEP_RESUME_STEP, etc."""
+        _make_valid_snapshot(tmp_path, resume_step=5, resume_step_name="research")
+
+        _run_hook(hook_module, cwd=tmp_path)
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        assert "DEEP_RESUME_STEP=5" in context
+        assert "DEEP_RESUME_NAME=research" in context
+        assert "DEEP_PLUGIN=deep-plan" in context
+
+    def test_outputs_only_session_id_when_snapshot_stale(self, hook_module, tmp_path, capsys):
+        """Stale snapshot (missing artifact) -> only DEEP_SESSION_ID output."""
+        _make_valid_snapshot(tmp_path, completed_artifacts=["missing-file.md"])
+
+        _run_hook(hook_module, cwd=tmp_path)
+
+        captured = capsys.readouterr()
+        assert "DEEP_SNAPSHOT" not in captured.out
+        assert "DEEP_SESSION_ID" in captured.out
+
+    def test_outputs_only_session_id_when_no_snapshot(self, hook_module, tmp_path, capsys):
+        """No snapshot found -> existing behavior, only DEEP_SESSION_ID."""
+        _run_hook(hook_module, cwd=tmp_path)
+
+        captured = capsys.readouterr()
+        assert "DEEP_SESSION_ID" in captured.out
+        assert "DEEP_SNAPSHOT" not in captured.out
+
+    def test_outputs_deep_hook_warning_when_errors_present(self, hook_module, tmp_path, capsys):
+        """Snapshot with hook_errors -> DEEP_HOOK_WARNING in additionalContext."""
+        errors = [{"hook": "write-section", "error": "parse failed", "timestamp": "t", "artifact": "a"}]
+        _make_valid_snapshot(tmp_path, hook_errors=errors)
+
+        _run_hook(hook_module, cwd=tmp_path)
+
+        captured = capsys.readouterr()
+        assert "DEEP_HOOK_WARNING" in captured.out
+
+    def test_clears_hook_errors_after_surfacing(self, hook_module, tmp_path, capsys):
+        """After outputting DEEP_HOOK_WARNING, hook_errors are cleared from snapshot."""
+        errors = [{"hook": "write-section", "error": "parse failed", "timestamp": "t", "artifact": "a"}]
+        snap_path = _make_valid_snapshot(tmp_path, hook_errors=errors)
+
+        _run_hook(hook_module, cwd=tmp_path)
+
+        # Re-read snapshot from disk
+        with open(snap_path) as f:
+            data = json.load(f)
+        assert data["hook_errors"] == []
+
+
+class TestSnapshotHookBackwardCompatibility:
+    """Ensure existing behavior is preserved when snapshot features are added."""
+
+    def test_existing_behavior_unchanged_without_snapshot(self, hook_module, tmp_path, capsys):
+        """When no snapshot exists, output is identical to pre-extension behavior."""
+        _run_hook(hook_module, cwd=tmp_path, env={"CLAUDE_PLUGIN_ROOT": "/plugin"})
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        lines = context.split("\n")
+        # Should have session_id and plugin_root only
+        assert any("DEEP_SESSION_ID=" in l for l in lines)
+        assert any("DEEP_PLUGIN_ROOT=" in l for l in lines)
+        assert not any("DEEP_SNAPSHOT" in l for l in lines)
+
+    def test_hook_returns_zero_on_snapshot_read_error(self, hook_module, tmp_path, capsys):
+        """Corrupt snapshot file does not crash hook; returns 0."""
+        (tmp_path / "snapshot.json").write_text("not valid json at all")
+
+        result = _run_hook(hook_module, cwd=tmp_path)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "DEEP_SESSION_ID" in captured.out
+
+    def test_json_parsing_errors_dont_crash_hook(self, hook_module, tmp_path, capsys):
+        """Malformed snapshot JSON is handled gracefully."""
+        (tmp_path / "snapshot.json").write_text("{broken")
+
+        result = _run_hook(hook_module, cwd=tmp_path)
+
+        assert result == 0
+        assert "DEEP_SNAPSHOT" not in capsys.readouterr().out
