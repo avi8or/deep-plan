@@ -17,11 +17,13 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Add parent to path for lib imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.config import get_or_create_session_config, ConfigError
+from lib.snapshot import read_snapshot, validate_snapshot, write_snapshot
 from lib.transcript_validator import validate_transcript_format
 from lib.sections import check_section_progress
 from lib.task_reconciliation import TaskListContext
@@ -255,6 +257,11 @@ def main():
         "--session-id",
         help="Session ID from hook's additionalContext (takes precedence over env vars)"
     )
+    parser.add_argument(
+        "--snapshot",
+        default=None,
+        help="Path to snapshot.json (from hook's additionalContext). Enables fast resume."
+    )
     args = parser.parse_args()
 
     file_path = Path(args.file)
@@ -386,14 +393,46 @@ def main():
         # Resume - use stored value if present, otherwise CLI arg
         review_mode = session_config.get("review_mode", args.review_mode)
 
-    # Scan for existing planning files
-    files_found = scan_planning_files(planning_dir)
+    # Snapshot-based fast resume
+    use_snapshot = False
+    snapshot_path = planning_dir / "snapshot.json"
 
-    # Check section progress (needed for accurate completion detection)
-    section_progress = check_section_progress(planning_dir)
+    if args.snapshot:
+        snapshot_path = Path(args.snapshot)
 
-    # Infer resume step from files and section progress
-    resume_step, last_completed = infer_resume_step(files_found, section_progress)
+    try:
+        snapshot_data = read_snapshot(str(snapshot_path))
+        if snapshot_data and validate_snapshot(snapshot_data, str(planning_dir)):
+            use_snapshot = True
+    except Exception:
+        snapshot_data = None
+
+    resume_step = None
+    last_completed = ""
+
+    if use_snapshot and snapshot_data:
+        resume_step = snapshot_data["resume_step"]
+        last_completed = snapshot_data.get("resume_step_name", "")
+    else:
+        snapshot_data = None  # Clear so we don't use stale data
+
+    if use_snapshot and args.snapshot:
+        # --snapshot flag: hook already validated, skip expensive file scan
+        # Derive file summary from snapshot's completed_artifacts
+        files_found = {
+            "research": False, "interview": False, "spec": False,
+            "plan": False, "integration_notes": False, "plan_tdd": False,
+            "reviews": [], "sections": [], "sections_index": False,
+        }
+        section_progress = check_section_progress(planning_dir)
+    else:
+        # Full scan needed: no snapshot, or snapshot without --snapshot flag
+        files_found = scan_planning_files(planning_dir)
+        section_progress = check_section_progress(planning_dir)
+
+    if not use_snapshot:
+        # Infer resume step from files and section progress
+        resume_step, last_completed = infer_resume_step(files_found, section_progress)
 
     # Build files summary
     files_summary = build_files_summary(files_found, section_progress)
@@ -598,6 +637,32 @@ def main():
     # Add error if task writing failed
     if task_write_error:
         result["task_write_error"] = task_write_error
+
+    # Write/update snapshot after successful setup
+    try:
+        current_step = resume_step if resume_step is not None else 22
+        snap_to_write = {
+            "version": 1,
+            "plugin": "deep-plan",
+            "session_id": context.task_list_id or "",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "resume_step": current_step,
+            "resume_step_name": STEP_NAMES.get(current_step, "complete") if current_step else "complete",
+            "completed_artifacts": [f for f in files_summary if not f.startswith("reviews/") and not f.startswith("sections/")],
+            "section_progress": {
+                "total": section_progress.get("total", 0),
+                "completed": section_progress.get("completed", 0),
+                "current": section_progress.get("next_section", ""),
+            } if section_progress.get("total") else None,
+            "task_summary": {"total": tasks_written, "completed": 0, "current_task_id": ""},
+            "git_branch": "",
+            "key_decisions": [],
+            "env_validation": None,
+            "hook_errors": [],
+        }
+        write_snapshot(str(planning_dir / "snapshot.json"), snap_to_write)
+    except Exception as e:
+        print(f"Warning: snapshot write failed: {e}", file=sys.stderr)
 
     print(json.dumps(result, indent=2))
     return 0

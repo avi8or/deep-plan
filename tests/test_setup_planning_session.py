@@ -1,10 +1,15 @@
 """Tests for setup-planning-session.py script."""
 
+import sys
 import pytest
 import subprocess
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from lib.snapshot import write_snapshot
 
 
 class TestSetupPlanningSession:
@@ -988,3 +993,164 @@ class TestConflictDetection:
 
         assert output["success"] is True
         assert "conflict" not in output
+
+
+class TestSnapshotIntegration:
+    """Tests for snapshot-aware resume detection in setup-planning-session.py."""
+
+    @pytest.fixture
+    def script_path(self):
+        return Path(__file__).parent.parent / "scripts" / "checks" / "setup-planning-session.py"
+
+    @pytest.fixture
+    def plugin_root(self):
+        return Path(__file__).parent.parent
+
+    @pytest.fixture
+    def run_script(self, script_path, plugin_root, tmp_path):
+        def _run(file_path: str, extra_args=None, env_overrides=None):
+            env = os.environ.copy()
+            env["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
+            env["DEEP_SESSION_ID"] = "test-session-snap"
+            env["HOME"] = str(tmp_path)
+            if env_overrides:
+                env.update(env_overrides)
+            cmd = [
+                "uv", "run", str(script_path),
+                "--file", file_path,
+                "--plugin-root", str(plugin_root),
+            ]
+            if extra_args:
+                cmd.extend(extra_args)
+            return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15)
+        return _run
+
+    def _write_valid_snapshot(self, planning_dir, **overrides):
+        """Write a valid snapshot.json in the planning dir."""
+        snap_path = str(planning_dir / "snapshot.json")
+        data = {
+            "version": 1,
+            "plugin": "deep-plan",
+            "session_id": "test-session-snap",
+            "updated_at": datetime(2099, 1, 1, tzinfo=timezone.utc).isoformat(),
+            "resume_step": 12,
+            "resume_step_name": "context-check-review",
+            "completed_artifacts": [],
+            "section_progress": None,
+            "task_summary": {"total": 21, "completed": 6, "current_task_id": "7"},
+            "git_branch": "",
+            "key_decisions": [],
+            "env_validation": None,
+            "hook_errors": [],
+        }
+        data.update(overrides)
+        write_snapshot(snap_path, data)
+        return snap_path
+
+    def test_falls_back_to_file_scan_when_no_snapshot(self, run_script, tmp_path):
+        """No snapshot -> backward compatible, file-scan based detection."""
+        spec_file = tmp_path / "spec.md"
+        spec_file.write_text("# Spec")
+        (tmp_path / "claude-research.md").write_text("# Research")
+
+        result = run_script(str(spec_file))
+        assert result.returncode == 0
+        output = json.loads(result.stdout)
+        assert output["success"] is True
+        # File scan should detect research file
+        assert output["resume_from_step"] == 8
+
+    def test_writes_snapshot_after_successful_setup(self, run_script, tmp_path):
+        """After setup completes, snapshot.json should exist."""
+        spec_file = tmp_path / "spec.md"
+        spec_file.write_text("# Spec")
+
+        result = run_script(str(spec_file))
+        assert result.returncode == 0
+
+        snap_path = tmp_path / "snapshot.json"
+        assert snap_path.exists()
+        with open(snap_path) as f:
+            snap = json.load(f)
+        assert snap["version"] == 1
+        assert snap["plugin"] == "deep-plan"
+        assert snap["resume_step"] == 6  # New session starts at step 6
+
+    def test_snapshot_flag_uses_snapshot_resume_step(self, run_script, tmp_path):
+        """--snapshot flag with valid snapshot uses its resume_step."""
+        spec_file = tmp_path / "spec.md"
+        spec_file.write_text("# Spec")
+        # Create files that would make file-scan return step 8
+        (tmp_path / "claude-research.md").write_text("# Research")
+        # But snapshot says step 12
+        snap_path = self._write_valid_snapshot(tmp_path, resume_step=12)
+
+        result = run_script(str(spec_file), extra_args=["--snapshot", snap_path])
+        assert result.returncode == 0
+        output = json.loads(result.stdout)
+        assert output["success"] is True
+        assert output["resume_from_step"] == 12
+
+    def test_falls_back_when_snapshot_stale(self, run_script, tmp_path):
+        """Stale snapshot (missing artifact) falls back to file scan."""
+        spec_file = tmp_path / "spec.md"
+        spec_file.write_text("# Spec")
+        (tmp_path / "claude-research.md").write_text("# Research")
+        # Snapshot lists a missing artifact
+        self._write_valid_snapshot(
+            tmp_path,
+            resume_step=14,
+            completed_artifacts=["nonexistent-file.md"],
+        )
+
+        result = run_script(str(spec_file))
+        assert result.returncode == 0
+        output = json.loads(result.stdout)
+        # Should fall back to file scan, which detects research
+        assert output["resume_from_step"] == 8
+
+    def test_auto_discovers_snapshot_without_flag(self, run_script, tmp_path):
+        """Valid snapshot in planning dir is used without --snapshot flag."""
+        spec_file = tmp_path / "spec.md"
+        spec_file.write_text("# Spec")
+        # Snapshot says step 12, no --snapshot flag needed
+        self._write_valid_snapshot(tmp_path, resume_step=12)
+
+        result = run_script(str(spec_file))
+        assert result.returncode == 0
+        output = json.loads(result.stdout)
+        assert output["resume_from_step"] == 12
+
+    def test_writes_snapshot_for_resume_session(self, run_script, tmp_path):
+        """Resume session writes snapshot with correct resume_step."""
+        spec_file = tmp_path / "spec.md"
+        spec_file.write_text("# Spec")
+        (tmp_path / "claude-research.md").write_text("# Research")
+        (tmp_path / "claude-interview.md").write_text("# Interview")
+
+        result = run_script(str(spec_file))
+        assert result.returncode == 0
+
+        snap_path = tmp_path / "snapshot.json"
+        assert snap_path.exists()
+        with open(snap_path) as f:
+            snap = json.load(f)
+        # File scan finds research + interview -> step 10
+        assert snap["resume_step"] == 10
+        assert "claude-research.md" in snap["completed_artifacts"]
+        assert "claude-interview.md" in snap["completed_artifacts"]
+
+    def test_snapshot_and_file_scan_agree(self, run_script, tmp_path):
+        """Snapshot resume_step matches file-scan inferred step."""
+        spec_file = tmp_path / "spec.md"
+        spec_file.write_text("# Spec")
+        (tmp_path / "claude-research.md").write_text("# Research")
+        (tmp_path / "claude-interview.md").write_text("# Interview")
+        (tmp_path / "claude-spec.md").write_text("# Spec doc")
+        # Snapshot matches what file-scan would find (step 11)
+        self._write_valid_snapshot(tmp_path, resume_step=11, resume_step_name="spec complete")
+
+        result = run_script(str(spec_file))
+        assert result.returncode == 0
+        output = json.loads(result.stdout)
+        assert output["resume_from_step"] == 11
