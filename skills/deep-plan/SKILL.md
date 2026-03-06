@@ -39,7 +39,9 @@ SECURITY:
 
 The SessionStart hook injects `DEEP_PLUGIN_ROOT=<path>` into your context. Look for it now — it appears alongside `DEEP_SESSION_ID` in your context from session startup. Use it as `plugin_root` for all script paths.
 
-**If `DEEP_PLUGIN_ROOT` is in your context**, run validate-env.sh directly:
+**If the setup script output includes `env_validation.cached: true`**, skip running validate-env.sh manually — the cached result is still valid for this session.
+
+**Otherwise**, if `DEEP_PLUGIN_ROOT` is in your context, run validate-env.sh directly:
 ```bash
 bash <DEEP_PLUGIN_ROOT value>/scripts/checks/validate-env.sh
 ```

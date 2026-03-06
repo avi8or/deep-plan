@@ -14,8 +14,10 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +25,7 @@ from pathlib import Path
 # Add parent to path for lib imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.config import get_or_create_session_config, ConfigError
-from lib.snapshot import read_snapshot, validate_snapshot, write_snapshot
+from lib.snapshot import read_snapshot, update_snapshot_field, validate_snapshot, write_snapshot
 from lib.transcript_validator import validate_transcript_format
 from lib.sections import check_section_progress
 from lib.task_reconciliation import TaskListContext
@@ -52,6 +54,95 @@ CONTEXT_TASK_IDS = [
     "context-initial-file",
     "context-review-mode",
 ]
+
+
+ENV_VALIDATION_KEYS = [
+    "GEMINI_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_CLOUD_PROJECT",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+]
+
+
+def compute_env_key_hash() -> str:
+    """Compute a hash of the relevant env var names that are currently set.
+
+    Returns a hex digest of the sorted list of present (non-empty) var names.
+    """
+    present = sorted(k for k in ENV_VALIDATION_KEYS if os.environ.get(k))
+    return hashlib.sha256("|".join(present).encode()).hexdigest()
+
+
+def should_skip_env_validation(
+    snapshot: dict | None,
+    current_session_id: str,
+    current_env_hash: str,
+) -> bool:
+    """Check if env validation can be skipped based on cached results.
+
+    Returns True only if ALL conditions are met:
+    - snapshot exists and has env_validation block
+    - env_validation.validated is True
+    - env_validation.session_id matches current_session_id
+    - env_validation.env_key_hash matches current_env_hash
+    """
+    if not snapshot:
+        return False
+    env_val = snapshot.get("env_validation")
+    if not env_val or not isinstance(env_val, dict):
+        return False
+    if not env_val.get("validated"):
+        return False
+    if env_val.get("session_id") != current_session_id:
+        return False
+    if env_val.get("env_key_hash") != current_env_hash:
+        return False
+    return True
+
+
+def run_and_cache_env_validation(
+    plugin_root: Path,
+    snapshot_path: Path,
+    session_id: str,
+) -> dict:
+    """Run validate-env.sh and cache the result in the snapshot.
+
+    1. Calls validate-env.sh via subprocess
+    2. Parses its JSON output
+    3. Updates the snapshot's env_validation block if validation succeeded
+    4. Returns the parsed validation result
+    """
+    validate_script = plugin_root / "scripts" / "checks" / "validate-env.sh"
+    try:
+        proc = subprocess.run(
+            ["bash", str(validate_script)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        result = json.loads(proc.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+        return {"valid": False, "errors": [str(e)], "cached": False}
+
+    # Only cache successful validations (both JSON valid flag AND zero exit code)
+    if result.get("valid") and proc.returncode == 0:
+        env_block = {
+            "validated": True,
+            "validated_at": datetime.now(timezone.utc).isoformat(),
+            "session_id": session_id,
+            "gemini_auth": result.get("gemini_auth"),
+            "openai_auth": result.get("openai_auth", False),
+            "env_key_hash": compute_env_key_hash(),
+        }
+        try:
+            update_snapshot_field(str(snapshot_path), env_validation=env_block)
+        except Exception as e:
+            print(f"Warning: failed to cache env validation: {e}", file=sys.stderr)
+
+    result["cached"] = False
+    return result
 
 
 def scan_planning_files(planning_dir: Path) -> dict:
@@ -407,6 +498,25 @@ def main():
     except Exception:
         snapshot_data = None
 
+    # Env validation caching
+    current_env_hash = compute_env_key_hash()
+    current_session_id = context.task_list_id or ""
+    env_validation_result = None
+
+    if should_skip_env_validation(snapshot_data, current_session_id, current_env_hash):
+        env_val = snapshot_data["env_validation"]
+        env_validation_result = {
+            "cached": True,
+            "gemini_auth": env_val.get("gemini_auth"),
+            "openai_auth": env_val.get("openai_auth", False),
+            "openrouter_auth": env_val.get("openrouter_auth", False),
+        }
+    else:
+        # Run full validation and cache result
+        env_validation_result = run_and_cache_env_validation(
+            plugin_root, snapshot_path, current_session_id,
+        )
+
     resume_step = None
     last_completed = ""
 
@@ -632,6 +742,8 @@ def main():
         "tasks_written": tasks_written,
         # Transcript validation (if available)
         "transcript_validation": transcript_validation,
+        # Env validation caching
+        "env_validation": env_validation_result,
     }
 
     # Add error if task writing failed

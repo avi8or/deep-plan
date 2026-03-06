@@ -1154,3 +1154,227 @@ class TestSnapshotIntegration:
         assert result.returncode == 0
         output = json.loads(result.stdout)
         assert output["resume_from_step"] == 11
+
+
+class TestEnvValidationCaching:
+    """Tests for env validation caching via snapshot."""
+
+    @pytest.fixture
+    def setup_mod(self):
+        """Import the setup-planning-session module."""
+        checks_path = str(Path(__file__).parent.parent / "scripts" / "checks")
+        if checks_path not in sys.path:
+            sys.path.insert(0, checks_path)
+        from importlib import import_module
+        return import_module("setup-planning-session")
+
+    def _clear_env_keys(self, monkeypatch):
+        """Clear all env validation keys."""
+        for key in [
+            "GEMINI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+        ]:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_compute_env_key_hash_deterministic(self, setup_mod, monkeypatch):
+        """Same env var set always produces the same hash."""
+        self._clear_env_keys(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+
+        hash1 = setup_mod.compute_env_key_hash()
+        hash2 = setup_mod.compute_env_key_hash()
+        assert hash1 == hash2
+        assert len(hash1) == 64  # SHA-256 hex digest
+
+    def test_compute_env_key_hash_differs_with_different_keys(self, setup_mod, monkeypatch):
+        """Different env var combinations produce different hashes."""
+        self._clear_env_keys(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+        hash_without_openrouter = setup_mod.compute_env_key_hash()
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+        hash_with_openrouter = setup_mod.compute_env_key_hash()
+
+        assert hash_without_openrouter != hash_with_openrouter
+
+    def test_compute_env_key_hash_ignores_values(self, setup_mod, monkeypatch):
+        """Hash only depends on which keys are SET, not their values."""
+        self._clear_env_keys(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "value-a")
+        hash_a = setup_mod.compute_env_key_hash()
+
+        monkeypatch.setenv("GEMINI_API_KEY", "completely-different-value")
+        hash_b = setup_mod.compute_env_key_hash()
+
+        assert hash_a == hash_b
+
+    def test_compute_env_key_hash_empty_string_treated_as_unset(self, setup_mod, monkeypatch):
+        """Env var set to empty string is treated as unset."""
+        self._clear_env_keys(monkeypatch)
+        hash_none = setup_mod.compute_env_key_hash()
+
+        monkeypatch.setenv("GEMINI_API_KEY", "")
+        hash_empty = setup_mod.compute_env_key_hash()
+
+        assert hash_none == hash_empty
+
+    def test_should_skip_when_cache_valid(self, setup_mod):
+        """Returns True when snapshot has valid env_validation matching session and hash."""
+        snapshot = {
+            "env_validation": {
+                "validated": True,
+                "session_id": "session-123",
+                "env_key_hash": "abc123",
+                "gemini_auth": "api_key",
+                "openai_auth": True,
+            }
+        }
+        assert setup_mod.should_skip_env_validation(snapshot, "session-123", "abc123") is True
+
+    def test_should_not_skip_when_no_snapshot(self, setup_mod):
+        """Returns False when snapshot is None."""
+        assert setup_mod.should_skip_env_validation(None, "session-123", "abc123") is False
+
+    def test_should_not_skip_when_no_env_validation(self, setup_mod):
+        """Returns False when snapshot has no env_validation block."""
+        snapshot = {"env_validation": None}
+        assert setup_mod.should_skip_env_validation(snapshot, "session-123", "abc123") is False
+
+    def test_should_not_skip_when_session_mismatch(self, setup_mod):
+        """Returns False when session_id doesn't match."""
+        snapshot = {
+            "env_validation": {
+                "validated": True,
+                "session_id": "old-session",
+                "env_key_hash": "abc123",
+                "gemini_auth": "api_key",
+                "openai_auth": True,
+            }
+        }
+        assert setup_mod.should_skip_env_validation(snapshot, "new-session", "abc123") is False
+
+    def test_should_not_skip_when_env_hash_mismatch(self, setup_mod):
+        """Returns False when env_key_hash doesn't match."""
+        snapshot = {
+            "env_validation": {
+                "validated": True,
+                "session_id": "session-123",
+                "env_key_hash": "old-hash",
+                "gemini_auth": "api_key",
+                "openai_auth": True,
+            }
+        }
+        assert setup_mod.should_skip_env_validation(snapshot, "session-123", "new-hash") is False
+
+    def test_should_not_skip_when_not_validated(self, setup_mod):
+        """Returns False when validated is False (failed validation not cached)."""
+        snapshot = {
+            "env_validation": {
+                "validated": False,
+                "session_id": "session-123",
+                "env_key_hash": "abc123",
+                "gemini_auth": None,
+                "openai_auth": False,
+            }
+        }
+        assert setup_mod.should_skip_env_validation(snapshot, "session-123", "abc123") is False
+
+    def test_run_and_cache_updates_snapshot_on_success(self, setup_mod, tmp_path, monkeypatch):
+        """After successful validation, snapshot's env_validation is updated."""
+        self._clear_env_keys(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+        # Create a fake validate-env.sh that outputs valid JSON
+        fake_plugin = tmp_path / "scripts" / "checks"
+        fake_plugin.mkdir(parents=True)
+        validate_script = fake_plugin / "validate-env.sh"
+        validate_script.write_text(
+            '#!/bin/bash\necho \'{"valid": true, "errors": [], "warnings": [], '
+            '"gemini_auth": "api_key", "openai_auth": true}\''
+        )
+        validate_script.chmod(0o755)
+
+        # Create snapshot file
+        snapshot_path = tmp_path / "snapshot.json"
+        write_snapshot(str(snapshot_path), {"version": 1, "env_validation": None})
+
+        setup_mod.run_and_cache_env_validation(
+            tmp_path, snapshot_path, "test-session"
+        )
+
+        # Verify snapshot was updated
+        import json as json_mod
+        with open(snapshot_path) as f:
+            snap = json_mod.load(f)
+        assert snap["env_validation"]["validated"] is True
+        assert snap["env_validation"]["session_id"] == "test-session"
+        assert snap["env_validation"]["gemini_auth"] == "api_key"
+        assert snap["env_validation"]["openai_auth"] is True
+        assert "env_key_hash" in snap["env_validation"]
+
+    def test_run_and_cache_does_not_cache_on_failure(self, setup_mod, tmp_path, monkeypatch):
+        """Failed validation (valid=false) is NOT cached in the snapshot."""
+        self._clear_env_keys(monkeypatch)
+
+        fake_plugin = tmp_path / "scripts" / "checks"
+        fake_plugin.mkdir(parents=True)
+        validate_script = fake_plugin / "validate-env.sh"
+        validate_script.write_text(
+            '#!/bin/bash\necho \'{"valid": false, "errors": ["Missing API key"], '
+            '"warnings": [], "gemini_auth": null, "openai_auth": false}\'\nexit 1'
+        )
+        validate_script.chmod(0o755)
+
+        snapshot_path = tmp_path / "snapshot.json"
+        write_snapshot(str(snapshot_path), {"version": 1, "env_validation": None})
+
+        result = setup_mod.run_and_cache_env_validation(
+            tmp_path, snapshot_path, "test-session"
+        )
+
+        assert result["valid"] is False
+        assert result["cached"] is False
+
+        import json as json_mod
+        with open(snapshot_path) as f:
+            snap = json_mod.load(f)
+        assert snap["env_validation"] is None
+
+    def test_run_and_cache_does_not_cache_on_nonzero_exit(self, setup_mod, tmp_path, monkeypatch):
+        """Non-zero exit code prevents caching even if JSON says valid=true."""
+        self._clear_env_keys(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+        fake_plugin = tmp_path / "scripts" / "checks"
+        fake_plugin.mkdir(parents=True)
+        validate_script = fake_plugin / "validate-env.sh"
+        validate_script.write_text(
+            '#!/bin/bash\necho \'{"valid": true, "errors": [], "warnings": [], '
+            '"gemini_auth": "api_key", "openai_auth": true}\'\nexit 1'
+        )
+        validate_script.chmod(0o755)
+
+        snapshot_path = tmp_path / "snapshot.json"
+        write_snapshot(str(snapshot_path), {"version": 1, "env_validation": None})
+
+        setup_mod.run_and_cache_env_validation(
+            tmp_path, snapshot_path, "test-session"
+        )
+
+        import json as json_mod
+        with open(snapshot_path) as f:
+            snap = json_mod.load(f)
+        # Should NOT have cached because exit code was non-zero
+        assert snap["env_validation"] is None
+
+    def test_run_and_cache_returns_result_on_script_missing(self, setup_mod, tmp_path):
+        """Returns error result when validate-env.sh doesn't exist."""
+        result = setup_mod.run_and_cache_env_validation(
+            tmp_path, tmp_path / "snapshot.json", "test-session"
+        )
+        assert result["valid"] is False
+        assert result["cached"] is False
+        assert len(result["errors"]) > 0
