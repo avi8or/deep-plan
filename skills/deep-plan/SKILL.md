@@ -104,11 +104,45 @@ Environment validated:
 
 **Check if user provided @file at invocation AND it's a spec file (ends with `.md`).**
 
-If NO @file was provided OR the path doesn't end with `.md`, output this and STOP:
+If a valid @file was provided (path ends with `.md`), proceed to Step 4.
+
+If NO @file was provided OR the path doesn't end with `.md`, run smart path detection:
+
+```bash
+uv run {plugin_root}/scripts/tools/detect_specs.py --search-dir "$(pwd)"
+```
+
+Parse the JSON output. If specs are found, present them:
+
+```
+═══════════════════════════════════════════════════════════════
+DEEP-PLAN: Available Specs
+═══════════════════════════════════════════════════════════════
+
+| # | Spec | Status | Blockers |
+|---|------|--------|----------|
+| 1 | 01-alpha | unplanned | - |
+| 2 | 02-beta | in_progress | - |
+| 3 | 03-gamma | sections_written | - |
+| 4 | 06-delta | unplanned | 03-gamma, 05-epsilon |
+
+═══════════════════════════════════════════════════════════════
+```
+
+Use `AskUserQuestion` to let the user pick a spec or provide a custom path:
+- Options: each discovered spec (label: name, description: status + blockers if any)
+- The user can also select "Other" to provide a custom path
+
+If the user picks a spec, set `file_path` to the spec's `path` value and proceed to Step 4.
+
+If NO specs are found, output the error message and stop:
+
 ```
 ═══════════════════════════════════════════════════════════════
 DEEP-PLAN: Spec File Required
 ═══════════════════════════════════════════════════════════════
+
+No spec.md files found in the current directory (searched 2 levels deep).
 
 This skill requires a markdown spec file path (must end with .md).
 The planning directory is inferred from the spec file's parent directory.
