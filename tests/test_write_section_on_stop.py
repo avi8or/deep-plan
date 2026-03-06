@@ -6,9 +6,13 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from lib.snapshot import write_snapshot, read_snapshot
 
 # Import wait_for_stable_file directly for unit testing
 # The script uses hyphens in its filename, so we need importlib
@@ -567,3 +571,162 @@ class TestWaitForStableFile:
         # Must contain the REAL section content, not the intermediate message
         assert "REAL section content" in content
         assert "different approach" not in content
+
+
+class TestHookErrorMarkers:
+    """Tests for error marker writing to snapshot."""
+
+    @pytest.fixture
+    def hook_script(self):
+        return Path(__file__).parent.parent / "scripts" / "hooks" / "write-section-on-stop.py"
+
+    def _make_snapshot(self, planning_dir: Path) -> Path:
+        """Create a valid snapshot.json in planning_dir."""
+        snap_path = planning_dir / "snapshot.json"
+        write_snapshot(str(snap_path), {
+            "version": 1,
+            "plugin": "deep-plan",
+            "session_id": "test",
+            "updated_at": "2099-01-01T00:00:00+00:00",
+            "resume_step": 20,
+            "resume_step_name": "sections",
+            "completed_artifacts": [],
+            "section_progress": None,
+            "task_summary": {"total": 0, "completed": 0, "current_task_id": ""},
+            "git_branch": "",
+            "key_decisions": [],
+            "env_validation": None,
+            "hook_errors": [],
+        })
+        return snap_path
+
+    def test_writes_error_when_transcript_parsing_fails(self, hook_script, tmp_path):
+        """Hook writes error to snapshot when transcript has no valid user message."""
+        # Create sections dir structure and snapshot
+        sections_dir = tmp_path / "sections"
+        sections_dir.mkdir()
+        prompts_dir = sections_dir / ".prompts"
+        prompts_dir.mkdir()
+        prompt_file = prompts_dir / "section-01-test-prompt.md"
+        prompt_file.write_text("# Prompt")
+
+        snap_path = self._make_snapshot(tmp_path)
+
+        # Create transcript with user message but NO valid prompt path
+        transcript_path = tmp_path / "transcript.jsonl"
+        lines = [
+            json.dumps({"message": {"role": "user", "content": "No path here at all"}}),
+            json.dumps({"message": {"role": "assistant", "content": "Some response"}}),
+        ]
+        transcript_path.write_text("\n".join(lines))
+
+        payload = {"agent_transcript_path": str(transcript_path)}
+        result = subprocess.run(
+            ["uv", "run", str(hook_script)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=get_test_env(tmp_path),
+        )
+
+        assert result.returncode == 0
+
+        snap = read_snapshot(str(snap_path))
+        assert len(snap["hook_errors"]) >= 1
+        error = snap["hook_errors"][-1]
+        assert error["hook"] == "write-section-on-stop.py"
+        assert "timestamp" in error
+        # Verify ISO8601 timestamp
+        datetime.fromisoformat(error["timestamp"])
+
+    @pytest.mark.skipif(os.getuid() == 0, reason="chmod test unreliable as root")
+    def test_writes_error_when_file_write_fails(self, hook_script, tmp_path):
+        """Hook writes error to snapshot when output file cannot be written."""
+        sections_dir = tmp_path / "sections"
+        sections_dir.mkdir()
+        prompts_dir = sections_dir / ".prompts"
+        prompts_dir.mkdir()
+        prompt_file = prompts_dir / "section-01-test-prompt.md"
+        prompt_file.write_text("# Prompt")
+
+        snap_path = self._make_snapshot(tmp_path)
+
+        transcript_path = tmp_path / "transcript.jsonl"
+        lines = [
+            json.dumps({"message": {"role": "user", "content": f"Read {prompt_file} and execute"}}),
+            json.dumps({"message": {"role": "assistant", "content": "# Section content"}}),
+        ]
+        transcript_path.write_text("\n".join(lines))
+
+        # Make sections_dir read-only to cause write failure
+        sections_dir.chmod(0o444)
+
+        payload = {"agent_transcript_path": str(transcript_path)}
+        try:
+            result = subprocess.run(
+                ["uv", "run", str(hook_script)],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                env=get_test_env(tmp_path),
+            )
+            assert result.returncode == 0
+        finally:
+            sections_dir.chmod(0o755)
+
+        snap = read_snapshot(str(snap_path))
+        assert len(snap["hook_errors"]) >= 1
+        error = snap["hook_errors"][-1]
+        assert error["hook"] == "write-section-on-stop.py"
+        assert "write" in error["error"].lower() or "permission" in error["error"].lower()
+        assert "section-01-test.md" in error["artifact"]
+        datetime.fromisoformat(error["timestamp"])
+
+    def test_error_entry_has_all_fields(self, hook_script, tmp_path):
+        """Error entry includes hook, error, timestamp, and artifact fields."""
+        snap_path = self._make_snapshot(tmp_path)
+
+        # Transcript with user message but no valid prompt path
+        transcript_path = tmp_path / "transcript.jsonl"
+        lines = [
+            json.dumps({"message": {"role": "user", "content": "No valid path in message"}}),
+            json.dumps({"message": {"role": "assistant", "content": "response"}}),
+        ]
+        transcript_path.write_text("\n".join(lines))
+
+        payload = {"agent_transcript_path": str(transcript_path)}
+        result = subprocess.run(
+            ["uv", "run", str(hook_script)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=get_test_env(tmp_path),
+        )
+
+        assert result.returncode == 0
+        snap = read_snapshot(str(snap_path))
+        assert len(snap["hook_errors"]) >= 1, "Expected at least one hook error recorded"
+        error = snap["hook_errors"][-1]
+        assert "hook" in error
+        assert "error" in error
+        assert "timestamp" in error
+        assert "artifact" in error
+        assert error["hook"] == "write-section-on-stop.py"
+        # Validate ISO8601 timestamp
+        datetime.fromisoformat(error["timestamp"])
+
+    def test_still_returns_zero_after_error_recording(self, hook_script, tmp_path):
+        """Hook returns 0 even when error is recorded (existing contract)."""
+        snap_path = self._make_snapshot(tmp_path)
+
+        # Transcript pointing to non-existent file
+        payload = {"agent_transcript_path": "/nonexistent/transcript.jsonl"}
+        result = subprocess.run(
+            ["uv", "run", str(hook_script)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=get_test_env(tmp_path),
+        )
+
+        assert result.returncode == 0

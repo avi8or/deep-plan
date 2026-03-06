@@ -505,6 +505,27 @@ class TestSnapshotIntegrationInHook:
             data = json.load(f)
         assert data["hook_errors"] == []
 
+    def test_multiple_errors_all_surfaced(self, hook_module, tmp_path, capsys):
+        """Multiple hook_errors entries are all included in DEEP_HOOK_WARNING."""
+        errors = [
+            {"hook": "write-section", "error": "parse failed", "timestamp": "t1", "artifact": "sec-01"},
+            {"hook": "write-section", "error": "file write failed", "timestamp": "t2", "artifact": "sec-02"},
+            {"hook": "other-hook", "error": "something else", "timestamp": "t3", "artifact": "unknown"},
+        ]
+        _make_valid_snapshot(tmp_path, hook_errors=errors)
+
+        _run_hook(hook_module, cwd=tmp_path)
+
+        captured = capsys.readouterr()
+        assert "DEEP_HOOK_WARNING" in captured.out
+        # format_resume_context joins last 3 errors with " | "
+        output = json.loads(captured.out)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        warning_line = [l for l in context.split("\n") if "DEEP_HOOK_WARNING" in l][0]
+        assert "parse failed" in warning_line
+        assert "file write failed" in warning_line
+        assert "something else" in warning_line
+
 
 class TestSnapshotHookBackwardCompatibility:
     """Ensure existing behavior is preserved when snapshot features are added."""

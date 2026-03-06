@@ -58,6 +58,57 @@ except ImportError as e:
     debug_log(f"Failed to import transcript_parser: {e}")
     raise
 
+try:
+    from lib.snapshot import append_hook_error
+    _snapshot_available = True
+except ImportError:
+    _snapshot_available = False
+
+
+def _find_snapshot_path(prompt_file_path: str | None, transcript_path: str | None) -> str | None:
+    """Derive snapshot.json path from prompt file path or transcript path.
+
+    Prompt path follows: <planning_dir>/sections/.prompts/<name>-prompt.md
+    So planning_dir is 3 levels up from the prompt file.
+    """
+    if prompt_file_path:
+        try:
+            planning_dir = Path(prompt_file_path).parent.parent.parent
+            snap = planning_dir / "snapshot.json"
+            if snap.is_file():
+                return str(snap)
+        except Exception:
+            pass
+
+    # Fallback: check transcript path's parent and up to 3 ancestor directories
+    if transcript_path:
+        search_dir = Path(transcript_path).parent
+        for _ in range(4):
+            snap = search_dir / "snapshot.json"
+            if snap.is_file():
+                return str(snap)
+            parent = search_dir.parent
+            if parent == search_dir:
+                break
+            search_dir = parent
+
+    # Fallback: try CWD
+    cwd_snap = Path.cwd() / "snapshot.json"
+    if cwd_snap.is_file():
+        return str(cwd_snap)
+
+    return None
+
+
+def _try_record_error(snapshot_path: str | None, error_msg: str, artifact: str) -> None:
+    """Best-effort write of hook error to snapshot. Never raises."""
+    if not snapshot_path or not _snapshot_available:
+        return
+    try:
+        append_hook_error(snapshot_path, "write-section-on-stop.py", error_msg, artifact)
+    except Exception:
+        pass
+
 
 def wait_for_stable_file(path: str, stability_ms: int = 200, timeout_s: float = 5.0, poll_ms: int = 50) -> None:
     """Wait for a file to stop being written to.
@@ -127,18 +178,26 @@ def main() -> int:
     wait_for_stable_file(transcript_path)
 
     # 3. Extract prompt file path from first user message
+    snapshot_path = None  # Will be discovered once we have prompt path
+    prompt_file_path = None
+
     try:
         first_user_msg = find_first_user_message(transcript_path)
         debug_log(f"First user message: {first_user_msg[:200]}...")
     except (FileNotFoundError, ValueError) as e:
         debug_log(f"Failed to get first user message: {e}")
+        snapshot_path = _find_snapshot_path(None, transcript_path)
+        _try_record_error(snapshot_path, f"Failed to read first user message: {e}", transcript_path or "unknown")
         return 0
 
     try:
         prompt_file_path = extract_prompt_file_path(first_user_msg)
         debug_log(f"Prompt file path: {prompt_file_path}")
+        snapshot_path = _find_snapshot_path(prompt_file_path, transcript_path)
     except ValueError as e:
         debug_log(f"Failed to extract prompt file path: {e}")
+        snapshot_path = _find_snapshot_path(None, transcript_path)
+        _try_record_error(snapshot_path, f"Failed to extract prompt path: {e}", transcript_path or "unknown")
         return 0
 
     # 4. Derive destination from prompt path
@@ -147,6 +206,7 @@ def main() -> int:
         debug_log(f"sections_dir = {sections_dir}, filename = {filename}")
     except ValueError as e:
         debug_log(f"Failed to derive destination: {e}")
+        _try_record_error(snapshot_path, f"Failed to derive destination: {e}", prompt_file_path)
         return 0
 
     # 5. Extract section content from last assistant message
@@ -155,12 +215,14 @@ def main() -> int:
         debug_log(f"Content length: {len(content)} bytes")
     except (FileNotFoundError, ValueError) as e:
         debug_log(f"Failed to get assistant content: {e}")
+        _try_record_error(snapshot_path, f"Failed to extract section content: {e}", prompt_file_path)
         return 0
 
     # 6. Write to destination
     sections_path = Path(sections_dir)
     if not sections_path.exists():
         debug_log(f"sections_dir does not exist: {sections_dir}")
+        _try_record_error(snapshot_path, f"sections_dir does not exist: {sections_dir}", prompt_file_path)
         return 0
 
     output_path = sections_path / filename
@@ -176,6 +238,7 @@ def main() -> int:
             debug_log("FAILED: File does not exist after write!")
     except OSError as e:
         debug_log(f"Failed to write file: {e}")
+        _try_record_error(snapshot_path, f"Failed to write section file: {e}", str(output_path))
         return 0
 
     debug_log("=== HOOK FINISHED ===")
